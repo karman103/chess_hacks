@@ -5,20 +5,19 @@ import os
 os.environ["PYTORCH_JIT_USE_NNPACK"] = "0"
 
 import random
-import math
 import argparse
 
 from model2 import PolicyValueNet, MCTS, board_to_tensor, index_to_move
 
 
 ###############################################
-# Move selection using your MCTS model
+# Model move via MCTS
 ###############################################
 def model_move(board, model, sims=64, device="cpu"):
     mcts = MCTS(model, sims=sims, cpuct=1.5, device=device)
     pi = mcts.run(board)
-    move_idx = int(torch.argmax(pi))
-    move = index_to_move(move_idx)
+    idx = int(torch.argmax(pi))
+    move = index_to_move(idx)
 
     if move not in board.legal_moves:
         move = random.choice(list(board.legal_moves))
@@ -26,58 +25,50 @@ def model_move(board, model, sims=64, device="cpu"):
 
 
 ###############################################
-# Play ONE game vs Stockfish
+# Play ONE game at Stockfish LEVEL
 ###############################################
-def play_game(model, sf_path, model_white=True, sims=64, device="cpu"):
+def play_game_at_level(model, sf_path, sf_level, model_white, sims, device):
+
     board = chess.Board()
     engine = chess.engine.SimpleEngine.popen_uci(sf_path)
 
+    # --- REAL WEAKENING THAT WORKS ON ALL STOCKFISH BUILDS ---
+    engine.configure({
+        "Skill Level": sf_level,            # 0–20
+        "UCI_LimitStrength": True,
+    })
+
+    # Depth scaling (critical)
+    sf_depth = 1 + sf_level  # SF1→depth2, SF8→depth9
+
     while not board.is_game_over():
+
         if (board.turn == chess.WHITE and model_white) or \
            (board.turn == chess.BLACK and not model_white):
-            # model plays
+
             move = model_move(board, model, sims=sims, device=device)
+
         else:
-            # stockfish plays
-            result = engine.play(board, chess.engine.Limit(time=0.05))
+            # Stockfish move at bounded depth
+            result = engine.play(board, chess.engine.Limit(depth=sf_depth))
             move = result.move
 
         board.push(move)
 
     engine.quit()
-    return board.result()  # "1-0", "0-1", "1/2-1/2"
+
+    return board.result()
 
 
 ###############################################
-# Compute Elo difference
-###############################################
-def elo_from_results(results):
-    wins = results["1-0"]
-    losses = results["0-1"]
-    draws = results["1/2-1/2"]
-    N = wins + losses + draws
-
-    if N == 0:
-        return 0
-
-    score = (wins + 0.5 * draws) / N
-
-    # Avoid log(0)
-    score = max(1e-6, min(1 - 1e-6, score))
-
-    elo = -400 * math.log10((1 / score) - 1)
-    return elo
-
-
-###############################################
-# Main
+# MAIN
 ###############################################
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="policy_value_sf.pt")
+    parser.add_argument("--model", type=str, default="../policy_value_sf.pt")
     parser.add_argument("--stockfish", type=str, default="/usr/games/stockfish")
-    parser.add_argument("--games", type=int, default=10)
-    parser.add_argument("--sims", type=int, default=64)
+    parser.add_argument("--games", type=int, default=5)
+    parser.add_argument("--sims", type=int, default=32)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -85,42 +76,44 @@ def main():
 
     # Load model
     model = PolicyValueNet().to(device)
-
-    raw_state = torch.load(args.model, map_location=device)
-
-    # Fix for DataParallel checkpoints
-    fixed_state = {k.replace("module.", ""): v for k, v in raw_state.items()}
-
-    model.load_state_dict(fixed_state)
-
+    raw = torch.load(args.model, map_location=device)
+    fixed = {k.replace("module.", ""): v for k, v in raw.items()}
+    model.load_state_dict(fixed)
     model.eval()
 
-    results = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
+    LEVELS = list(range(1, 8 + 1))  # 1 to 8
+    print(f"Evaluating against Stockfish levels: {LEVELS}")
+    all_results = {}
 
-    for i in range(args.games):
-        model_white = (i % 2 == 0)
+    for lvl in LEVELS:
+        print(f"\n===== Evaluating Stockfish Level {lvl} =====\n")
+        results = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
 
-        res = play_game(
-            model=model,
-            sf_path=args.stockfish,
-            model_white=model_white,
-            sims=args.sims,
-            device=device,
-        )
-        results[res] += 1
+        for g in range(args.games):
+            model_white = (g % 2 == 0)
 
-        print(f"Game {i+1}/{args.games}: {res}")
+            res = play_game_at_level(
+                model=model,
+                sf_path=args.stockfish,
+                sf_level=lvl,
+                model_white=model_white,
+                sims=args.sims,
+                device=device,
+            )
 
-    print("\n===== RESULTS =====")
-    print(results)
+            results[res] += 1
+            print(f"Game {g+1}/{args.games}: {res}")
 
-    elo = elo_from_results(results)
-    print(f"\nEstimated Elo difference vs Stockfish Level 1: {elo:.1f} Elo")
+        all_results[lvl] = results
+        print(f"Results vs SF {lvl}: {results}")
 
-    # Approximate SF Level 1 Elo anchor
-    stockfish_level1_elo = 1150
-    model_elo = stockfish_level1_elo + elo
-    print(f"Approximate Model Elo: {model_elo:.1f}")
+    # Final summary
+    print("\n\n========== FINAL SUMMARY (SF 1–8) ==========\n")
+    print(f"{'Lvl':<5}{'W':<4}{'L':<4}{'D':<4}")
+    print("-" * 20)
+    for lvl in LEVELS:
+        r = all_results[lvl]
+        print(f"{lvl:<5}{r['1-0']:<4}{r['0-1']:<4}{r['1/2-1/2']:<4}")
 
 
 if __name__ == "__main__":
