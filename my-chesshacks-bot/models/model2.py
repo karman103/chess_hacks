@@ -13,6 +13,118 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+####################################################
+# EXTRA: EVALUATION VS ALL STOCKFISH LEVELS (0–20)
+####################################################
+
+def model_move(board, model, sims=32, device="cpu"):
+    mcts = MCTS(model, sims=sims, cpuct=1.5, device=device)
+    pi = mcts.run(board)
+    idx = int(torch.argmax(pi))
+    move = index_to_move(idx)
+    if move not in board.legal_moves:
+        move = random.choice(list(board.legal_moves))
+    return move
+
+
+def play_game_vs_sf(model, sf_path, sf_level, model_white, sims, device):
+    board = chess.Board()
+    engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+
+    # Stockfish config per level
+    sf_config = {
+        "Skill Level": sf_level,
+        "UCI_LimitStrength": True,
+        "UCI_Elo": 1350 + sf_level * 75  # approximate scaling
+    }
+    engine.configure(sf_config)
+
+    while not board.is_game_over():
+        if (board.turn == chess.WHITE and model_white) or \
+           (board.turn == chess.BLACK and not model_white):
+            move = model_move(board, model, sims=sims, device=device)
+        else:
+            result = engine.play(board, chess.engine.Limit(time=0.05))
+            move = result.move
+        board.push(move)
+
+    engine.quit()
+    return board.result()
+
+
+def elo_from_results(results):
+    wins = results["1-0"]
+    losses = results["0-1"]
+    draws = results["1/2-1/2"]
+
+    N = wins + losses + draws
+    if N == 0:
+        return 0
+
+    score = (wins + 0.5 * draws) / N
+    score = max(1e-6, min(1 - 1e-6, score))
+
+    return -400 * math.log10((1 / score) - 1)
+
+
+def eval_all_levels(model_path, sf_path, games, sims, device):
+    # Load model
+    model = PolicyValueNet().to(device)
+    raw = torch.load(model_path, map_location=device)
+    fixed = {k.replace("module.", ""): v for k, v in raw.items()}
+    model.load_state_dict(fixed)
+    model.eval()
+
+    SKILL_LEVELS = list(range(0, 21))
+    summary = {}
+
+    for lvl in SKILL_LEVELS:
+        print(f"\n======================")
+        print(f" Evaluating Stockfish Level {lvl}")
+        print(f"======================")
+
+        results = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
+
+        for g in range(games):
+            model_white = (g % 2 == 0)
+            res = play_game_vs_sf(
+                model=model,
+                sf_path=sf_path,
+                sf_level=lvl,
+                model_white=model_white,
+                sims=sims,
+                device=device,
+            )
+            results[res] += 1
+            print(f"  Game {g+1}/{games}: {res}")
+
+        dElo = elo_from_results(results)
+        sf_elo = 1150 + 75 * (lvl - 1)
+        model_elo = sf_elo + dElo
+
+        summary[lvl] = {
+            "results": results,
+            "elo_diff": dElo,
+            "approx_model_elo": model_elo,
+        }
+
+        print(f"Results vs Level {lvl}: {results}")
+        print(f"Elo diff: {dElo:.1f}")
+        print(f"Model Elo: {model_elo:.1f}")
+
+    # Final table
+    print("\n\n======================")
+    print(" FINAL SUMMARY TABLE")
+    print("======================\n")
+
+    print(f"{'Lvl':<5}{'W':<4}{'L':<4}{'D':<4}{'ΔElo':<10}{'ModelElo'}")
+    print("-" * 45)
+
+    for lvl in SKILL_LEVELS:
+        r = summary[lvl]["results"]
+        de = summary[lvl]["elo_diff"]
+        me = summary[lvl]["approx_model_elo"]
+        print(f"{lvl:<5}{r['1-0']:<4}{r['0-1']:<4}{r['1/2-1/2']:<4}{de:<10.1f}{me:.1f}")
 
 
 # ===============================
@@ -538,6 +650,9 @@ def main():
     pgn_p.add_argument("--pgn", type=str, required=True, help="PGN string.")
     pgn_p.add_argument("--sims", type=int, default=200, help="Number of MCTS simulations.")
 
+
+
+
     args = parser.parse_args()
 
     if args.cmd == "gen-data":
@@ -560,9 +675,19 @@ def main():
     elif args.cmd == "pgn-move":
         move_uci = get_move_from_pgn(args.pgn, args.model, sims=args.sims)
         print(move_uci)
+        # eval all stockfish levels
     else:
         raise ValueError(f"Unknown command {args.cmd}")
+    
+    print("\n==== AUTO EVAL MODE: Evaluating Stockfish Levels 0–20 ====\n")
 
+    eval_all_levels(
+        model_path=args.model,
+        sf_path=args.engine,
+        games=args.games,
+        sims=args.sims,
+        device=DEVICE,
+    )
 
 if __name__ == "__main__":
     main()
