@@ -5,6 +5,10 @@ import time
 
 # Write code here that runs once
 # Can do things like load models from huggingface, make connections to subprocesses, etcwenis
+model = model2.PolicyValueNet()
+model_path = os.path.join(os.path.dirname(__file__), "policy_value_sf.pt")
+model.eval()
+
 
 
 @chess_manager.entrypoint
