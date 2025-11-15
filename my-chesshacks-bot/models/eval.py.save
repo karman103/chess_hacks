@@ -1,4 +1,4 @@
-import chess
+§import chess
 import chess.engine
 import torch
 import os
@@ -25,48 +25,50 @@ def model_move(board, model, sims=64, device="cpu"):
 
 
 ###############################################
-# Play ONE game vs Stockfish at level
+# Play ONE game at Stockfish LEVEL
 ###############################################
 def play_game_at_level(model, sf_path, sf_level, model_white, sims, device):
+
     board = chess.Board()
     engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+	
+    elo_mapping = {
+	1: 1350,
+	2: 1400,
+	3: 1500,
+	4: 1600,
+	5: 1850,
+	7: 2000,
+	8: 2150
+     }	
+    # --- REAL WEAKENING THAT WORKS ON ALL STOCKFISH BUILDS ---
+    engine.configure({
+        "Skill Level": sf_level,            # 0–20
+        "UCI_LimitStrength": True,
+	"UCI_Elo": elo_mapping.get(sf_level, 1500)
+    })
 
-    # Hard-code: full-strength SF, we weaken only via nodes.
-    engine.configure({"Threads": 1})
-    engine.configure({"Skill Level": 20})   # max strength, no Elo limiting
-    engine.configure({"UCI_LimitStrength": False})
-
-    # Make levels VERY different
-    nodes_map = {
-        1: 50,
-        2: 200,
-        3: 800,
-        4: 3_000,
-        5: 12_000,
-        6: 50_000,
-        7: 200_000,
-        8: 800_000,
-    }
-
-    nodes = nodes_map[sf_level]
-    print(f"[INFO] SF level {sf_level}: nodes = {nodes}")
+    # Depth scaling (critical)
+    sf_depth = 1 + sf_level  # SF1→depth2, SF8→depth9
 
     while not board.is_game_over():
+
         if (board.turn == chess.WHITE and model_white) or \
            (board.turn == chess.BLACK and not model_white):
 
             move = model_move(board, model, sims=sims, device=device)
+
         else:
-            result = engine.play(
-                board,
-                chess.engine.Limit(nodes=nodes),
-            )
+            # Stockfish move at bounded depth
+            result = engine.play(board, chess.engine.Limit(depth=sf_depth))
             move = result.move
 
         board.push(move)
 
     engine.quit()
+
     return board.result()
+
 
 ###############################################
 # MAIN
@@ -89,7 +91,7 @@ def main():
     model.load_state_dict(fixed)
     model.eval()
 
-    LEVELS = list(range(1, 9))  # 1 to 8
+    LEVELS = list(range(1, 8 + 1))  # 1 to 8
     print(f"Evaluating against Stockfish levels: {LEVELS}")
     all_results = {}
 
@@ -126,3 +128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

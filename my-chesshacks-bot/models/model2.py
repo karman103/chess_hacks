@@ -422,7 +422,12 @@ def train_distill(
     model = torch.nn.DataParallel(PolicyValueNet()).to(DEVICE)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-
+    if torch.backends.mps.is_available():
+        print("Using MPS optimizer workaround")
+    elif torch.cuda.is_available():
+        print("Using CUDA with Adam optimizer")
+    else:
+        print("Using CPU with Adam optimizer")
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
