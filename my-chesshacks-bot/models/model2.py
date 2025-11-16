@@ -14,36 +14,55 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from multiprocessing import Pool
+
+from multiprocessing import Process, Value, Lock
+# `ceil` is unused now, so you can drop it entirely
+
 from math import ceil
 
-def _sf_worker(args):
+def _sf_worker(
+    worker_id: int,
+    n_positions: int,
+    engine_path: str,
+    depth: int,
+    multipv: int,
+    max_plies: int,
+    out_path: str,
+    global_counter: "Value",
+    counter_lock: "Lock",
+    total_positions: int,
+):
     """
     Worker for parallel Stockfish data gen.
-    Runs entirely in one process with its own Stockfish engine.
+    Each worker:
+      - runs its own Stockfish engine
+      - writes to its own temp file
+      - updates a shared global counter for [gen] progress prints
     """
-    worker_id, n_positions, engine_path, depth, multipv, max_plies = args
-    print(f"[WORKER {worker_id}] Starting, n_positions={n_positions}")
+    print(f"[WORKER {worker_id}] Starting, n_positions={n_positions}", flush=True)
 
     engine = chess.engine.SimpleEngine.popen_uci(engine_path)
-    records = []
 
-    for i in range(n_positions):
-        board = random_board(max_plies=max_plies)
-        policy, value = sf_policy_value(engine, board, depth=depth, k=multipv)
-        rec = {
-            "fen": board.fen(),
-            "policy": policy,
-            "value": value,
-        }
-        records.append(rec)
+    with open(out_path, "w") as f:
+        for i in range(n_positions):
+            board = random_board(max_plies=max_plies)
+            policy, value = sf_policy_value(engine, board, depth=depth, k=multipv)
+            rec = {
+                "fen": board.fen(),
+                "policy": policy,
+                "value": value,
+            }
+            f.write(json.dumps(rec) + "\n")
 
-        if (i + 1) % 50 == 0:
-            print(f"[WORKER {worker_id}] {i+1}/{n_positions}")
+            # 🔥 global progress
+            with counter_lock:
+                global_counter.value += 1
+                # print every 100 positions globally (tweak as you like)
+                if global_counter.value % 100 == 0:
+                    print(f"[gen] {global_counter.value}/{total_positions}", flush=True)
 
     engine.quit()
-    print(f"[WORKER {worker_id}] Done.")
-    return records
+    print(f"[WORKER {worker_id}] Done.", flush=True)
 
 # ===============================
 # Device selection
@@ -396,12 +415,19 @@ def sf_policy_value(
         # no moves or no scores; treat as draw-ish
         return {}, 0.0
 
-    abs_scores = [abs(s) for s in scores]
-    total = sum(abs_scores)
-    if total <= 0.0:
-        probs = [1.0 / len(moves)] * len(moves)
-    else:
-        probs = [a / total for a in abs_scores]
+    import torch
+    import numpy as np
+
+    # Convert Stockfish centipawn evals into logits
+    scores_np = np.array(scores, dtype=np.float32)
+
+    # Temperature — lower = sharper, higher = smoother
+    T = 200.0  # good default for Stockfish multipv
+
+    # Softmax over (-score/T) so best score → highest prob
+    logits = torch.tensor(scores_np) * (-1.0 / T)
+    probs = torch.softmax(logits, dim=0).tolist()
+
 
     policy = {m.uci(): p for m, p in zip(moves, probs)}
 
@@ -445,7 +471,6 @@ def generate_sf_data(
 
     engine.quit()
     print(f"[GEN] Saved Stockfish data to {out_path}")
-
 def generate_sf_data_parallel(
     engine_path: str,
     out_path: str,
@@ -456,8 +481,8 @@ def generate_sf_data_parallel(
     num_workers: Optional[int] = None,
 ) -> None:
     """
-    Parallel Stockfish data generation using multiprocessing.
-    Spawns one engine per worker.
+    Parallel Stockfish data generation using separate processes.
+    Each worker writes to its own temp file; main process merges them.
     """
     if num_workers is None:
         num_workers = max(1, (os.cpu_count() or 1) - 1)
@@ -465,21 +490,53 @@ def generate_sf_data_parallel(
     print(f"[GEN-PAR] Using engine: {engine_path}")
     print(f"[GEN-PAR] n_positions={n_positions}, workers={num_workers}")
 
-    # Split positions across workers
+    # Split positions across workers as evenly as possible
     base = n_positions // num_workers
     rem = n_positions % num_workers
-    chunks = [base + (1 if i < rem else 0) for i in range(num_workers)]
-    chunks = [c for c in chunks if c > 0]
+    counts = [base + (1 if i < rem else 0) for i in range(num_workers)]
+    counts = [c for c in counts if c > 0]
 
-    worker_args = [
-        (wid, n_pos, engine_path, depth, multipv, max_plies)
-        for wid, n_pos in enumerate(chunks)
-    ]
+    # Shared counter and lock for global progress
+    global_counter = Value("i", 0)
+    counter_lock = Lock()
 
-    with Pool(processes=len(worker_args)) as pool, open(out_path, "w") as f:
-        for records in pool.imap_unordered(_sf_worker, worker_args):
-            for rec in records:
-                f.write(json.dumps(rec) + "\n")
+    procs: List[Process] = []
+    tmp_paths: List[str] = []
+
+    for wid, n_pos in enumerate(counts):
+        tmp_out = f"{out_path}.part{wid}"
+        tmp_paths.append(tmp_out)
+
+        p = Process(
+            target=_sf_worker,
+            args=(
+                wid,
+                n_pos,
+                engine_path,
+                depth,
+                multipv,
+                max_plies,
+                tmp_out,
+                global_counter,
+                counter_lock,
+                n_positions,
+            ),
+        )
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join()
+
+    # Merge partial files into final output
+    with open(out_path, "w") as fout:
+        for tmp in tmp_paths:
+            if not os.path.exists(tmp):
+                continue
+            with open(tmp, "r") as fin:
+                for line in fin:
+                    fout.write(line)
+            os.remove(tmp)
 
     print(f"[GEN-PAR] Saved Stockfish data to {out_path}")
 
@@ -564,9 +621,8 @@ def self_play_one_game(
 
     return records
 
-
 def generate_selfplay_data(
-    model_path: str,
+    model_path: Optional[str],
     out_path: str,
     n_games: int = 100,
     sims: int = 200,
@@ -574,11 +630,22 @@ def generate_selfplay_data(
 ) -> None:
     """
     Generate self-play games using the current network, AlphaZero-style.
+
+    If model_path is provided and exists, load it.
+    Otherwise, use a freshly initialized PolicyValueNet (random weights).
     """
-    print(f"[SELFPLAY] Loading model from {model_path}")
     model = PolicyValueNet().to(DEVICE)
-    state = torch.load(model_path, map_location=DEVICE)
-    model.load_state_dict(state)
+
+    if model_path is not None and os.path.exists(model_path):
+        print(f"[SELFPLAY] Loading model from {model_path}")
+        state = torch.load(model_path, map_location=DEVICE)
+        model.load_state_dict(state)
+    else:
+        if model_path is None:
+            print("[SELFPLAY] No model path provided; using randomly initialized network.")
+        else:
+            print(f"[SELFPLAY] WARNING: model '{model_path}' not found; using randomly initialized network.")
+
     model.eval()
 
     with open(out_path, "w") as f:
@@ -592,7 +659,6 @@ def generate_selfplay_data(
             print(f"[SELFPLAY] Game {g+1}: {len(game_records)} positions")
 
     print(f"[SELFPLAY] Saved {total_positions} positions from {n_games} games to {out_path}")
-
 
 # ===============================
 # Training loop (supervised on JSONL)
