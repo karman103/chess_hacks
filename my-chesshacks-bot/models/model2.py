@@ -14,11 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-
 from multiprocessing import Process, Value, Lock
-# `ceil` is unused now, so you can drop it entirely
-
 from math import ceil
+
 
 def _sf_worker(
     worker_id: int,
@@ -63,6 +61,7 @@ def _sf_worker(
 
     engine.quit()
     print(f"[WORKER {worker_id}] Done.", flush=True)
+
 
 # ===============================
 # Device selection
@@ -196,16 +195,81 @@ class PolicyValueNet(nn.Module):
 
 
 # ===============================
+# Batched inference manager
+# ===============================
+
+
+class BatchManager:
+    """
+    Simple local batching helper for MCTS:
+      - collect (state_key, tensor) pairs
+      - run them through the model in one big batch
+      - store outputs in a dict keyed by state_key
+    """
+
+    def __init__(self, model: PolicyValueNet, device: torch.device, batch_size: int = 32):
+        self.model = model
+        self.device = device
+        self.batch_size = batch_size
+        self.pending: List[Tuple[str, torch.Tensor]] = []
+        self.outputs: Dict[str, Tuple[torch.Tensor, float]] = {}
+
+    def request(self, state_key: str, tensor: torch.Tensor) -> None:
+        """
+        Queue a single (state_key, tensor) for batched evaluation.
+        tensor is (17, 8, 8) on CPU.
+        """
+        self.pending.append((state_key, tensor))
+        if len(self.pending) >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        """
+        Run all pending tensors through the network in one batch.
+        """
+        if not self.pending:
+            return
+
+        keys, tensors = zip(*self.pending)
+        batch = torch.stack(tensors).to(self.device)  # (B,17,8,8)
+
+        with torch.no_grad():
+            logits_batch, values_batch = self.model(batch)
+
+        logits_batch = logits_batch.cpu()
+        values_batch = values_batch.cpu()
+
+        for i, key in enumerate(keys):
+            self.outputs[key] = (logits_batch[i], float(values_batch[i].item()))
+
+        self.pending = []
+
+    def get(self, state_key: str) -> Optional[Tuple[torch.Tensor, float]]:
+        """
+        Retrieve and remove stored (logits, value) for a given state_key.
+        """
+        return self.outputs.pop(state_key, None)
+
+
+# ===============================
 # MCTS
 # ===============================
 
 
 class MCTS:
-    def __init__(self, model: PolicyValueNet, sims: int = 200, cpuct: float = 1.5, device: torch.device = DEVICE):
+    def __init__(
+        self,
+        model: PolicyValueNet,
+        sims: int = 200,
+        cpuct: float = 1.5,
+        device: torch.device = DEVICE,
+        batch_size: int = 32,
+    ):
         self.model = model
         self.sims = sims
         self.cpuct = cpuct
         self.device = device
+        self.batch_size = batch_size
 
         # state_key -> prior policy (Tensor 4096)
         self.P: Dict[str, torch.Tensor] = {}
@@ -232,85 +296,111 @@ class MCTS:
         else:
             return 0.0
 
+    def _backup(self, path: List[Tuple[str, int, bool]], v_final: float, root_turn: bool) -> None:
+        """
+        Backup value v_final along the path of (state_key, action_idx, turn_at_state).
+        """
+        for s_key, a_idx, turn_at_state in reversed(path):
+            sign = 1.0 if turn_at_state == root_turn else -1.0
+            self.Nsa[(s_key, a_idx)] = self.Nsa.get((s_key, a_idx), 0) + 1
+            self.Wsa[(s_key, a_idx)] = self.Wsa.get((s_key, a_idx), 0.0) + sign * v_final
+            self.Ns[s_key] = self.Ns.get(s_key, 0) + 1
+
     def run(self, root_board: chess.Board) -> torch.Tensor:
         """
         Run MCTS simulations from root_board.
+        Uses batched NN inference for leaf evaluations.
         Returns a 4096-dim policy vector (visit count distribution).
         """
         root_turn = root_board.turn
+        batch_mgr = BatchManager(self.model, self.device, batch_size=self.batch_size)
 
-        for _ in range(self.sims):
-            board = root_board.copy()
-            path: List[Tuple[str, int, bool]] = []  # (state_key, move_idx, turn_at_state)
+        sims_done = 0
+        while sims_done < self.sims:
+            # Selection for up to batch_size simulations
+            pending_leaves: List[Tuple[str, chess.Board, List[Tuple[str, int, bool]]]] = []
 
-            # SELECTION & EXPANSION
-            while True:
-                s_key = self._state_key(board)
+            batch_quota = min(self.batch_size, self.sims - sims_done)
+            for _ in range(batch_quota):
+                board = root_board.copy()
+                path: List[Tuple[str, int, bool]] = []
 
-                if board.is_game_over():
-                    v = self._terminal_value(board)
-                    break
+                while True:
+                    s_key = self._state_key(board)
 
-                if s_key not in self.P:
-                    # expand leaf
-                    x = board_to_tensor(board).unsqueeze(0).to(self.device)
-                    with torch.no_grad():
-                        logits, v_net = self.model(x)
-                    logits = logits[0].cpu()
-                    v = float(v_net[0].cpu())
-
-                    # mask illegal moves
-                    policy = torch.full((64 * 64,), float("-inf"))
-                    legal_moves = list(board.legal_moves)
-                    if not legal_moves:
-                        self.P[s_key] = torch.zeros(64 * 64)
-                        self.V[s_key] = 0.0
-                        v = 0.0
+                    # Terminal node
+                    if board.is_game_over():
+                        v = self._terminal_value(board)
+                        self._backup(path, v, root_turn)
                         break
 
-                    for move in legal_moves:
-                        idx = move_to_index(move)
-                        policy[idx] = logits[idx]
+                    # Leaf node: queue for batched NN evaluation
+                    if s_key not in self.P:
+                        tensor = board_to_tensor(board)  # (17,8,8) on CPU
+                        batch_mgr.request(s_key, tensor)
+                        pending_leaves.append((s_key, board.copy(), path))
+                        break
 
-                    policy = torch.softmax(policy, dim=0)
-                    self.P[s_key] = policy
-                    self.V[s_key] = v
-                    break  # leaf node expanded
+                    # Selection: choose move via UCB
+                    policy = self.P[s_key]
+                    sum_N = self.Ns.get(s_key, 0) + 1
+                    best_score = -1e9
+                    best_move_idx: Optional[int] = None
+                    best_move: Optional[chess.Move] = None
 
-                # choose move via UCB
-                policy = self.P[s_key]
-                sum_N = self.Ns.get(s_key, 0) + 1
-                best_score = -1e9
-                best_move_idx: Optional[int] = None
-                best_move: Optional[chess.Move] = None
+                    for move in board.legal_moves:
+                        a_idx = move_to_index(move)
+                        n_sa = self.Nsa.get((s_key, a_idx), 0)
+                        w_sa = self.Wsa.get((s_key, a_idx), 0.0)
+                        q = w_sa / n_sa if n_sa > 0 else 0.0
+                        u = self.cpuct * policy[a_idx].item() * math.sqrt(sum_N) / (1 + n_sa)
+                        score = q + u
+                        if score > best_score:
+                            best_score = score
+                            best_move_idx = a_idx
+                            best_move = move
 
-                for move in board.legal_moves:
-                    a_idx = move_to_index(move)
-                    n_sa = self.Nsa.get((s_key, a_idx), 0)
-                    w_sa = self.Wsa.get((s_key, a_idx), 0.0)
-                    q = w_sa / n_sa if n_sa > 0 else 0.0
-                    u = self.cpuct * policy[a_idx].item() * math.sqrt(sum_N) / (1 + n_sa)
-                    score = q + u
-                    if score > best_score:
-                        best_score = score
-                        best_move_idx = a_idx
-                        best_move = move
+                    if best_move is None or best_move_idx is None:
+                        # Should not generally happen, but treat as draw
+                        v = 0.0
+                        self._backup(path, v, root_turn)
+                        break
 
-                if best_move is None or best_move_idx is None:
-                    v = 0.0
-                    break
+                    path.append((s_key, best_move_idx, board.turn))
+                    board.push(best_move)
 
-                path.append((s_key, best_move_idx, board.turn))
-                board = board.copy()
-                board.push(best_move)
+                sims_done += 1
 
-            # BACKUP
-            v_final = v
-            for s_key, a_idx, turn_at_state in reversed(path):
-                sign = 1.0 if turn_at_state == root_turn else -1.0
-                self.Nsa[(s_key, a_idx)] = self.Nsa.get((s_key, a_idx), 0) + 1
-                self.Wsa[(s_key, a_idx)] = self.Wsa.get((s_key, a_idx), 0.0) + sign * v_final
-                self.Ns[s_key] = self.Ns.get(s_key, 0) + 1
+            # Run batched inference on all leaf nodes gathered in this mini-batch
+            batch_mgr.flush()
+
+            # Expansion + backup for all pending leaves
+            for s_key, leaf_board, path in pending_leaves:
+                out = batch_mgr.get(s_key)
+                if out is None:
+                    # Shouldn't happen; skip
+                    continue
+                logits, v = out
+
+                # Mask illegal moves
+                policy = torch.full((64 * 64,), float("-inf"))
+                legal_moves = list(leaf_board.legal_moves)
+                if not legal_moves:
+                    # No legal moves from this state, treat as draw-ish leaf
+                    self.P[s_key] = torch.zeros(64 * 64)
+                    self.V[s_key] = 0.0
+                    self._backup(path, 0.0, root_turn)
+                    continue
+
+                for move in legal_moves:
+                    idx = move_to_index(move)
+                    policy[idx] = logits[idx]
+
+                policy = torch.softmax(policy, dim=0)
+                self.P[s_key] = policy
+                self.V[s_key] = v
+
+                self._backup(path, v, root_turn)
 
         # build root policy from visit counts
         root_key = self._state_key(root_board)
@@ -415,7 +505,6 @@ def sf_policy_value(
         # no moves or no scores; treat as draw-ish
         return {}, 0.0
 
-    import torch
     import numpy as np
 
     # Convert Stockfish centipawn evals into logits
@@ -427,7 +516,6 @@ def sf_policy_value(
     # Softmax over (-score/T) so best score → highest prob
     logits = torch.tensor(scores_np) * (-1.0 / T)
     probs = torch.softmax(logits, dim=0).tolist()
-
 
     policy = {m.uci(): p for m, p in zip(moves, probs)}
 
@@ -471,6 +559,8 @@ def generate_sf_data(
 
     engine.quit()
     print(f"[GEN] Saved Stockfish data to {out_path}")
+
+
 def generate_sf_data_parallel(
     engine_path: str,
     out_path: str,
@@ -575,6 +665,16 @@ def self_play_one_game(
     while not board.is_game_over() and move_count < max_moves:
         mcts = MCTS(model, sims=sims, cpuct=1.5, device=DEVICE)
         pi = mcts.run(board)  # (4096,)
+                # === FIX 2: Dirichlet noise at root, adds exploration to avoid draw loops ===
+        if move_count == 0:  # Only on root each turn
+            legal = list(board.legal_moves)
+            if len(legal) > 1:
+                import numpy as np
+                noise = np.random.dirichlet([0.3] * len(legal))
+                # mix noise into MCTS distribution
+                for i, move in enumerate(legal):
+                    idx = move_to_index(move)
+                    pi[idx] = 0.75 * pi[idx] + 0.25 * noise[i]
 
         # Build dict of legal moves -> prob (from MCTS visit distribution)
         policy_dict: Dict[str, float] = {}
@@ -597,7 +697,13 @@ def self_play_one_game(
 
         # Choose move: argmax for now (you could sample for more exploration)
         best_idx = max(range(len(move_probs)), key=lambda i: probs[i])
-        chosen_move = move_probs[best_idx][0]
+        # chosen_move = move_probs[best_idx][0]
+        import random
+        chosen_move = random.choices(
+            [m for (m,p) in move_probs],
+            weights=[max(p, 1e-6) for (m,p) in move_probs],
+            k=1
+        )[0]
 
         # Record state before making the move
         history.append((board.fen(), policy_dict, board.turn))
@@ -621,44 +727,94 @@ def self_play_one_game(
 
     return records
 
-def generate_selfplay_data(
+
+def train_on_selfplay_batch(model, batch, opt):
+    """
+    batch = list of records like:
+       {"fen": ..., "policy": {...}, "value": z}
+    This performs 1 gradient update like AlphaZero.
+    """
+    model.train()
+
+    xs = []
+    pi_targets = []
+    v_targets = []
+
+    for rec in batch:
+        board = chess.Board(rec["fen"])
+        xs.append(board_to_tensor(board))
+
+        # policy target -> vector of 4096
+        pi_vec = torch.zeros(4096)
+        for uci, p in rec["policy"].items():
+            move = chess.Move.from_uci(uci)
+            idx = move_to_index(move)
+            pi_vec[idx] = p
+        pi_targets.append(pi_vec)
+
+        v_targets.append(torch.tensor(rec["value"], dtype=torch.float32))
+
+    x = torch.stack(xs).to(DEVICE)
+    pi_t = torch.stack(pi_targets).to(DEVICE)
+    v_t = torch.stack(v_targets).to(DEVICE)
+
+    opt.zero_grad()
+
+    logits, v_pred = model(x)
+    log_p = F.log_softmax(logits, dim=1)
+
+    # KL for policy
+    policy_loss = F.kl_div(log_p, pi_t, reduction="batchmean")
+
+    # MSE for value
+    value_loss = F.mse_loss(v_pred, v_t)
+
+    loss = policy_loss + 0.5 * value_loss
+    loss.backward()
+    opt.step()
+
+    return loss.item(), policy_loss.item(), value_loss.item()
+
+
+def selfplay_learn(
     model_path: Optional[str],
-    out_path: str,
+    out_model_path: str,
     n_games: int = 100,
     sims: int = 200,
     max_moves: int = 512,
-) -> None:
+    lr: float = 1e-3,
+):
     """
-    Generate self-play games using the current network, AlphaZero-style.
-
-    If model_path is provided and exists, load it.
-    Otherwise, use a freshly initialized PolicyValueNet (random weights).
+    Full AlphaZero-style reinforcement learning:
+      - self-play
+      - train on self-play every game
+      - update model continuously
     """
     model = PolicyValueNet().to(DEVICE)
 
     if model_path is not None and os.path.exists(model_path):
-        print(f"[SELFPLAY] Loading model from {model_path}")
+        print(f"[RL] Loading starting model from {model_path}")
         state = torch.load(model_path, map_location=DEVICE)
         model.load_state_dict(state)
     else:
-        if model_path is None:
-            print("[SELFPLAY] No model path provided; using randomly initialized network.")
-        else:
-            print(f"[SELFPLAY] WARNING: model '{model_path}' not found; using randomly initialized network.")
+        print("[RL] Starting from scratch (no model found).")
 
-    model.eval()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-    with open(out_path, "w") as f:
-        total_positions = 0
-        for g in range(n_games):
-            print(f"[SELFPLAY] Starting game {g+1}/{n_games}")
-            game_records = self_play_one_game(model, sims=sims, max_moves=max_moves)
-            for rec in game_records:
-                f.write(json.dumps(rec) + "\n")
-            total_positions += len(game_records)
-            print(f"[SELFPLAY] Game {g+1}: {len(game_records)} positions")
+    for g in range(n_games):
+        print(f"[RL] ===== Game {g+1}/{n_games} =====")
+        game_records = self_play_one_game(model, sims=sims, max_moves=max_moves)
 
-    print(f"[SELFPLAY] Saved {total_positions} positions from {n_games} games to {out_path}")
+        loss, ploss, vloss = train_on_selfplay_batch(model, game_records, opt)
+
+        print(f"[RL] Game {g+1} finished: positions={len(game_records)}")
+        print(f"[RL] Loss total={loss:.4f}  policy={ploss:.4f}  value={vloss:.4f}")
+
+        # save checkpoint each game
+        torch.save(model.state_dict(), out_model_path)
+
+    print(f"[RL] Finished. Final model saved to {out_model_path}")
+
 
 # ===============================
 # Training loop (supervised on JSONL)
@@ -726,7 +882,6 @@ def train_supervised(
 
     torch.save(model.state_dict(), out_model_path)
     print(f"[TRAIN] Saved model to {out_model_path}")
-
 
 
 # Backwards compatibility name
@@ -810,15 +965,19 @@ def main():
     train_p.add_argument("--batch", type=int, default=64)
     train_p.add_argument("--lr", type=float, default=1e-3)
 
-
-
     # self-play (AlphaZero style)
-    sp_p = subparsers.add_parser("selfplay", help="Generate AlphaZero-style self-play games.")
-    sp_p.add_argument("--model", type=str, default="policy_value_sf.pt", help="Path to starting model.")
-    sp_p.add_argument("--out", type=str, default="selfplay_data.jsonl", help="Output JSONL file.")
-    sp_p.add_argument("--games", type=int, default=100, help="Number of self-play games.")
-    sp_p.add_argument("--sims", type=int, default=200, help="MCTS simulations per move.")
-    sp_p.add_argument("--max-moves", type=int, default=512, help="Max moves per game.")
+    # AlphaZero selfplay DATA ONLY
+    sp_p = subparsers.add_parser("selfplay-data", help="Generate pure self-play data without learning.")
+    ...
+
+    # AlphaZero full reinforcement learning
+    rl_p = subparsers.add_parser("selfplay", help="Self-play + online learning (AlphaZero RL).")
+    rl_p.add_argument("--model", type=str, default=None)
+    rl_p.add_argument("--out", type=str, default="policy_value_rl.pt")
+    rl_p.add_argument("--games", type=int, default=100)
+    rl_p.add_argument("--sims", type=int, default=200)
+    rl_p.add_argument("--max-moves", type=int, default=512)
+    rl_p.add_argument("--lr", type=float, default=1e-3)
 
     # move from PGN
     pgn_p = subparsers.add_parser("pgn-move", help="Given a PGN string, output best move in UCI.")
@@ -859,15 +1018,16 @@ def main():
             lr=args.lr,
         )
 
-
     elif args.cmd == "selfplay":
-        generate_selfplay_data(
+        selfplay_learn(
             model_path=args.model,
-            out_path=args.out,
+            out_model_path=args.out,
             n_games=args.games,
             sims=args.sims,
             max_moves=args.max_moves,
+            lr=args.lr,
         )
+
     elif args.cmd == "pgn-move":
         move_uci = get_move_from_pgn(args.pgn, args.model, sims=args.sims)
         print(move_uci)

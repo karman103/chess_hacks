@@ -4,3 +4,10 @@ venv
 .env.local
 .env
 devtools
+rocm-env/
+*.pt
+*.pth
+__pycache__/
+*.jsonl
+*.log
+*.egg-info/
