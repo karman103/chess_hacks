@@ -4,8 +4,8 @@ import time
 import math
 import chess
 
-from evaluate import evaluate
-from pgn_to_fen import pgn_to_fen
+from .evaluate import evaluate
+from .pgn_to_fen import pgn_to_fen
 
 INF = 1e9
 
