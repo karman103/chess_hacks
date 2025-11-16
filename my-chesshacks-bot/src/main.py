@@ -8,75 +8,79 @@ import torch
 import torch.nn.functional as F
 
 
-# Import your minimax components
-from minmax import model3
 
-# Initialize the searcher once
-# Adjust these parameters based on your needs:
-# - For bullet: max_depth=2-3, time_limit=0.1-0.3
-# - For rapid: max_depth=4, time_limit=1-2
-searcher = model3.MinimaxSearcher(max_depth=3, time_limit=0.5)
+# Write code here that runs once
+# Can do things like load models from huggingface, make connections to subprocesses, etcwenis
+model = model2.PolicyValueNet()
+model_path = os.path.join(os.path.dirname(__file__), "policy_value_sf.pt")
+model.eval()
+
+
 
 @chess_manager.entrypoint
 def test_func(ctx: GameContext):
+    #
+
     print("Cooking move...")
     print(ctx.board.move_stack)
-    
+    time.sleep(0.1)
+
     legal_moves = list(ctx.board.generate_legal_moves())
     if not legal_moves:
         ctx.logProbabilities({})
-        raise ValueError("No legal moves available")
-    
-    # If only one legal move, just return it
-    if len(legal_moves) == 1:
-        ctx.logProbabilities({legal_moves[0]: 1.0})
-        return legal_moves[0]
-    
+        raise ValueError("No legal moves available (i probably lost didn't i)")
+
     try:
-        print("Step 1: Running minimax search...")
-        best_move, score = model3.searcher.search(ctx.board)
-        print(f"Step 2: Best move found: {best_move.uci() if best_move else None}")
-        print(f"Step 3: Score: {score}, Nodes searched: {searcher.nodes}")
+        print("Step 3: Encoding board...")
+        board_tensor = model2.board_to_tensor(ctx.board)
+        print(f"Step 4: Board tensor shape: {board_tensor.shape}")
         
-        if best_move is None:
-            # Fallback: pick a random legal move
-            print("Warning: No move found, selecting random legal move")
-            best_move = legal_moves[0]
+        board_tensor = board_tensor.unsqueeze(0)
+        print(f"Step 5: After unsqueeze: {board_tensor.shape}")
         
-        # Create probability distribution
-        # Give the best move high probability, others low
+        print("Step 6: Running model...")
+        with torch.no_grad():
+            policy_logits, value = model(board_tensor)
+        print(f"Step 7: Got predictions. Policy shape: {policy_logits.shape}")
+        
+        print("Step 8: Applying softmax...")
+        policy_probs = F.softmax(policy_logits, dim=-1).squeeze(0)
+        print(f"Step 9: Policy probs shape: {policy_probs.shape}")
+        
+        print("Step 10: Getting move probabilities...")
         move_probs = {}
         for move in legal_moves:
-            if move == best_move:
-                move_probs[move] = 0.9  # High confidence in best move
-            else:
-                move_probs[move] = 0.1 / (len(legal_moves) - 1)
+            move_idx = model2.move_to_index(move)
+            move_probs[move] = policy_probs[move_idx].item()
+        print(f"Step 11: Extracted {len(move_probs)} move probabilities")
         
-        # Normalize to ensure sum = 1.0
+        print("Step 12: Normalizing...")
         total_prob = sum(move_probs.values())
         if total_prob > 0:
             move_probs = {move: prob / total_prob for move, prob in move_probs.items()}
+        else:
+            uniform_prob = 1.0 / len(legal_moves)
+            move_probs = {move: uniform_prob for move in legal_moves}
         
-        print("Step 4: Logging probabilities...")
+        print("Step 13: Selecting best move...")
+        best_move = max(move_probs, key=move_probs.get)
+        
+        print("Step 14: Logging probabilities...")
         ctx.logProbabilities(move_probs)
         
-        print(f"Step 5: RETURNING MOVE: {best_move.uci()}")
+        print(f"Step 15: RETURNING MOVE: {best_move.uci()}")
         return best_move
         
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"ERROR at some step: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback to random move
-        fallback_move = legal_moves[0]
-        ctx.logProbabilities({fallback_move: 1.0})
-        return fallback_move
+        raise
 
 @chess_manager.reset
 def reset_func(ctx: GameContext):
-    # Clear the transposition table for a fresh game
-    global searcher
-    searcher.tt.clear()
-    searcher.nodes = 0
-    searcher.time_up = False
-    print("Game reset: cleared transposition table")
+    # This gets called when a new game begins
+    # Should do things like clear caches, reset model state, etc.
+    pass
+
+
