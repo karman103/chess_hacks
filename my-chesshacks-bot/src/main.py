@@ -12,7 +12,7 @@ import torch.nn.functional as F
 # Write code here that runs once
 # Can do things like load models from huggingface, make connections to subprocesses, etcwenis
 model = model2.PolicyValueNet()
-model_path = os.path.join(os.path.dirname(__file__), "policy_value_sf.pt")
+model_path = os.path.join(os.path.dirname(__file__), "policy_model_fp16.pt")
 model.eval()
 
 
@@ -64,6 +64,7 @@ def test_func(ctx: GameContext):
         
         print("Step 13: Selecting best move...")
         best_move = max(move_probs, key=move_probs.get)
+   
         
         print("Step 14: Logging probabilities...")
         ctx.logProbabilities(move_probs)
