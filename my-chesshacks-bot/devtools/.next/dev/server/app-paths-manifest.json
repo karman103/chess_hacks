@@ -1,0 +1,5 @@
+{
+  "/api/bot/route": "app/api/bot/route.js",
+  "/api/reload/status/route": "app/api/reload/status/route.js",
+  "/page": "app/page.js"
+}

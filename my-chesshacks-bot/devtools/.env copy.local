@@ -1,0 +1,3 @@
+PYTHON_EXECUTABLE=/root/chess_hacks/my-chesshacks-bot/rocm-env/bin/python
+SERVE_PORT=5058
+PORT=3000
